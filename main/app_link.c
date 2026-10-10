@@ -109,7 +109,10 @@ static bool s_start_requested = false;
 static uint16_t s_tx_chr_handle = 0;
 static uint16_t s_voice_chr_handle = 0;
 
-// 本次连接是否已主动发过 hello（退订后重置，允许重连时重新握手）。
+// 本次连接是否已主动发过 hello（**连接边界清零**：见 CONNECT/DISCONNECT 分支）。
+// 它只用来保证"同一条连接里不重复发"，绝不能跨连接沿用 —— 否则主机错过唯一
+// 那一条 hello 之后（或主机是重新连上来的），设备在本次开机期间再也不会补发，
+// 主机面板的固件版本/协议版本/电量就一直是"—"。
 static bool s_hello_sent = false;
 // 当前主机的 token 是否校验通过（未配对/不符时为 false → 业务消息一律拒绝）
 static bool s_host_token_ok = false;
@@ -215,6 +218,12 @@ static void drain_tx_queue(void)
 }
 
 // ── 发送路径 ──────────────────────────────────────────────────────────────
+
+// 版本字符串会整段进 hello 控制帧（见 send_control_short_ex 的 buf）。长度失控就会
+// 挤爆定长缓冲并被 snprintf **静默**截断成坏 JSON。这里把约束固定在编译期：
+// 上限 64 字节，相对 256 字节的帧缓冲留有充分余量。
+_Static_assert(sizeof(AP_FIRMWARE_VERSION) <= 64,
+               "AP_FIRMWARE_VERSION 过长：请同步放大 send_control_short_ex 的缓冲");
 
 static bool emit_to_queue(const uint8_t *frame, uint16_t frame_len, void *user)
 {
@@ -352,15 +361,26 @@ esp_err_t ap_link_send_voice(uint16_t msg_id, const uint8_t *data, uint16_t len)
 static void send_control_short_ex(const char *type, uint16_t ref_msg_id, const char *extra,
                                   bool ack_required)
 {
-    // 160 字节：hello 带 firmware+batteryPercent 后整包约 110 字节，
-    // 96 的旧尺寸会在 snprintf 处静默截断成坏 JSON（连右括号都丢了）。
-    char buf[160];
+    // ★ 尺寸跟着"最长的 extra"走，并且**检查 snprintf 的返回值**。
+    //   历史教训两次同源：
+    //     1) 96 字节时代，hello 带 firmware+batteryPercent 被截断成坏 JSON；
+    //     2) 改到 160 后，版本号多出 "-dirty"（26→32 字符）又把 162 字节的
+    //        整包截掉尾部 "97}"，主机解析失败后静默丢弃 —— 面板三项永远"—"。
+    //   snprintf 会**静默**截断，所以返回值必须查；宁可明确报错不发，
+    //   也不要发一条对端只会丢掉的半截 JSON。
+    char buf[256];
+    int n;
     if (extra && extra[0]) {
-        snprintf(buf, sizeof(buf), "{\"type\":\"%s\",\"msgId\":%u,%s}", type,
-                 (unsigned)ref_msg_id, extra);
+        n = snprintf(buf, sizeof(buf), "{\"type\":\"%s\",\"msgId\":%u,%s}", type,
+                     (unsigned)ref_msg_id, extra);
     } else {
-        snprintf(buf, sizeof(buf), "{\"type\":\"%s\",\"msgId\":%u}", type,
-                 (unsigned)ref_msg_id);
+        n = snprintf(buf, sizeof(buf), "{\"type\":\"%s\",\"msgId\":%u}", type,
+                     (unsigned)ref_msg_id);
+    }
+    if (n < 0 || (size_t)n >= sizeof(buf)) {
+        ESP_LOGE(TAG, "控制帧过长，拒绝发送（需 %d 字节 / 缓冲 %u，type=%s）",
+                 n, (unsigned)sizeof(buf), type);
+        return;
     }
     (void)ap_link_send_json(buf, ack_required);
 }
@@ -464,18 +484,30 @@ static void handle_control_message(const char *json)
         if (!ap_json_str(json, "host", host, sizeof(host))) host[0] = '\0';
         const esp_err_t rc = has_code ? ap_pair_begin(code, host, token) : ESP_ERR_INVALID_ARG;
         if (rc == ESP_OK) {
-            char out[96];
-            snprintf(out, sizeof(out), "\"deviceId\":\"%s\",\"token\":\"%s\"",
-                     ap_pair_device_id(), token);
+            // 与 hello 同源的坑：定长缓冲装不下就**静默**截断成坏 JSON。
+            // 这里 deviceId+token 已占 62 字节，96 只剩 5 字节余量，deviceId 变长即翻车。
+            char out[160];
+            const int on = snprintf(out, sizeof(out), "\"deviceId\":\"%s\",\"token\":\"%s\"",
+                                    ap_pair_device_id(), token);
+            if (on < 0 || (size_t)on >= sizeof(out)) {
+                ESP_LOGE(TAG, "pair.ok 字段过长（需 %d / 缓冲 %u），拒绝发送",
+                         on, (unsigned)sizeof(out));
+                return;
+            }
             send_control_short_ex(AP_MSG_PAIR_OK, 0, out, true);
             app_screens_hide(AP_SCREEN_PAIR);      // 配对成功：收起配对码页
             app_ui_post_toast("配对成功", false);
             ESP_LOGI(TAG, "配对完成，已回 pair.ok");
         } else {
             const bool limited = (rc == ESP_ERR_INVALID_STATE);
-            char out[96];
-            snprintf(out, sizeof(out), "\"reason\":\"%s\",\"remaining\":%d",
-                     limited ? "rate-limited" : "bad-code", ap_pair_attempts_left());
+            char out[160];
+            const int on = snprintf(out, sizeof(out), "\"reason\":\"%s\",\"remaining\":%d",
+                                    limited ? "rate-limited" : "bad-code", ap_pair_attempts_left());
+            if (on < 0 || (size_t)on >= sizeof(out)) {
+                ESP_LOGE(TAG, "pair.failed 字段过长（需 %d / 缓冲 %u），拒绝发送",
+                         on, (unsigned)sizeof(out));
+                return;
+            }
             send_control_short_ex(AP_MSG_PAIR_FAILED, 0, out, true);
         }
         return;
@@ -781,6 +813,12 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
+            // ★ 每条新连接都允许重新握手。
+            //   hello 是"本连接内一次性"的消息，标志绝不能跨连接沿用：
+            //   只在退订时清零的写法会让主机错过那一唯一的一条 hello 之后，
+            //   整个开机周期内都不再收到设备信息 —— 面板的固件版本/协议版本/
+            //   电量会永远是"—"，而主机自己发起的握手却照样成功，很难看出来。
+            s_hello_sent = false;
             s_conn_handle = event->connect.conn_handle;
             s_adv_retry_pending = false;
             s_adv_retry_count = 0;
@@ -800,6 +838,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "连接断开 reason=%d", event->disconnect.reason);
+        // 连接边界同样清零：掉线（对端不会发退订）之后也能重新握手。
+        s_hello_sent = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_chunk_payload = FALLBACK_CHUNK_PAYLOAD;
         ap_rx_reset(&s_rx);
@@ -841,16 +881,35 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             // 握手是链路能否进入 READY 的前提，必须要求确认。
             // 电量字段来自 ap_link_set_battery 的缓存（BLE 回调里不能读 ADC）；
             // 未知（-1）就不带字段，主机面板据此显示"—"而不是错的 0%。
-            static char hello_extra[160];
+            // ★ 缓冲区必须容得下**最长的**版本字符串。
+            //   真实事故：版本号从 "1.1.0+gv1.1.0-dsh-passport"（26 字符）变成
+            //   带 "-dirty" 的 32 字符后，整条 hello 从 156 字节涨到 162 字节，
+            //   160 字节的缓冲把尾部 "97}" 截掉，JSON 变成
+            //   …"batteryPercent": 这种半截内容。主机解析失败后**静默丢弃**，
+            //   于是面板的固件版本/协议版本/电量永远是"—"，而握手（hello.ack
+            //   很短，另走一条路径）照常成功，极难定位。
+            static char hello_extra[192];
             int n = snprintf(hello_extra, sizeof(hello_extra),
                              "\"protocolVersion\":1,\"firmware\":\"%s\",\"capabilities\":0,"
                              "\"paired\":%d,\"deviceId\":\"%s\"",
                              AP_FIRMWARE_VERSION, ap_pair_is_paired() ? 1 : 0,
                              ap_pair_device_id());
+            if (n < 0 || (size_t)n >= sizeof(hello_extra)) {
+                // 宁可退化成最小 hello，也不要发半截 JSON（对端只会静默丢弃）。
+                ESP_LOGE(TAG, "hello 附加字段过长（需 %d / 缓冲 %u），退化为最小 hello",
+                         n, (unsigned)sizeof(hello_extra));
+                n = snprintf(hello_extra, sizeof(hello_extra),
+                             "\"protocolVersion\":1,\"deviceId\":\"%s\"", ap_pair_device_id());
+            }
             const int bat = s_battery_percent;
             if (n > 0 && (size_t)n < sizeof(hello_extra) && bat >= 0) {
-                snprintf(hello_extra + n, sizeof(hello_extra) - n,
-                         ",\"batteryPercent\":%d", bat);
+                const int m = snprintf(hello_extra + n, sizeof(hello_extra) - n,
+                                       ",\"batteryPercent\":%d", bat);
+                if (m < 0 || (size_t)m >= sizeof(hello_extra) - (size_t)n) {
+                    // 电量塞不下就整段不要：已经写进去的半截字段必须回退掉。
+                    hello_extra[n] = '\0';
+                    ESP_LOGW(TAG, "hello 放不下电量字段，本次不带电量上报");
+                }
             }
             send_control_short_ex(AP_MSG_HELLO, 0, hello_extra, true);
             ESP_LOGI(TAG, "已主动发送 hello（等待主机 hello.ack，电量 %d）", bat);
