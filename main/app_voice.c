@@ -5,8 +5,8 @@
 //   → 缓冲够一条消息(< AP_MAX_PAYLOAD_BYTES)就 ap_link_send_voice 发出
 //
 // ★ 三个不能踩的坑（详见 docs/05-语音发送-设计.md）：
-//   1. **绝不缓冲整段录音**：400KB RAM 装不下 15s（32KB/s 原始 + BLE 栈 + LVGL）。
-//      用静态缓冲、够一条消息就发、源端丢帧。
+//   1. **绝不缓冲整段录音**：400KB RAM 装不下长录音（32KB/s 原始 + BLE 栈 + LVGL）。
+//      用静态缓冲、够一条消息就发、源端丢帧；因此录音上限只受"多久停"约束，与 RAM 无关。
 //   2. **ADPCM 表必须与 voice.js 的 decodeImaAdpcm 逐字节一致**，否则解出来是噪声。
 //      两张表从 voice.js 抄，附注释，不"优化"。
 //   3. **一次录音跨多条 BLE 消息**（单消息 2048B 载荷上限），主机按到达顺序拼
@@ -36,11 +36,10 @@ static const char *TAG = "app_voice";
 #define READ_SAMPLES       (SAMPLE_RATE * READ_MS / 1000)   // 320
 #define READ_BYTES         (READ_SAMPLES * 2)    // 640
 
-#define MAX_MS             15000                 // 录音上限 15s
-#define MAX_READS          (MAX_MS / READ_MS)    // 750 轮
-#define SILENCE_MS         1200                  // 静音自动结束
-#define SILENCE_READS      (SILENCE_MS / READ_MS) // 60 轮
-#define VAD_RMS_THRESHOLD  500                   // RMS 门限（低于视为静音，可调）
+// 录音硬上限：由协议常量推导，两端只有一个事实来源（app_proto.h）。
+#define MAX_MS             (AP_AUDIO_MAX_SECONDS * 1000)
+#define MAX_READS          (MAX_MS / READ_MS)
+// 静态缓冲 + 源端丢帧，绝不缓冲整段录音，所以上限只受"多久停"约束、与 RAM 无关。
 
 // 发送缓冲：ADPCM 4:1 后 20ms ≈ 160B。攒到 ~1600B（< 2048 载荷上限）就发一条。
 // 留余量，避免 tx_enqueue 因超上限拒绝。
@@ -123,8 +122,16 @@ static adpcm_state_t s_adpcm;
 static int s_block_bytes = 0;            // 当前 ADPCM 块已写的数据字节数
 #define ADPCM_BLOCK_DATA 504              // 与主机解码的 504B 数据边界一致
 
-static int s_read_count = 0;             // 本轮已读次数（15s 上限）
-static int s_silence_count = 0;          // 连续静音计数
+static int s_read_count = 0;             // 本轮已读次数（上限见 s_max_reads）
+
+/**
+ * 本次生效的录音上限（轮数）。主机通过 config 消息下发秒数，
+ * 这里换算成轮数并夹在 [1, MAX_READS]。默认取协议硬上限。
+ *
+ * 为什么是运行时值而不是编译期常量：用户要求"上限可设置"（默认 60s，可选 120/360），
+ * 而设备端写 NVS 有磨损、两边各存一份必然分叉 —— 所以事实来源在主机，设备只存内存态。
+ */
+static volatile int s_max_reads = MAX_READS;
 
 static int16_t s_pcm[READ_SAMPLES];      // 20ms PCM 读缓冲
 
@@ -234,7 +241,6 @@ static void app_voice_task(void *arg)
         s_adpcm.predictor = 0;
         s_adpcm.step_index = 0;
         s_read_count = 0;
-        s_silence_count = 0;
         xSemaphoreGive(s_lock);
 
         char begin[128];
@@ -272,30 +278,23 @@ static void app_voice_task(void *arg)
             }
             s_read_count++;
 
-            // VAD：连续静音 1.2s 自动结束。
+            // 电平统计：maxRms 随 voice.end 上报，供主机区分"麦克风没采到"与"链路/解码问题"。
             //
-            // ★ 但**仅当按键已松开**时才自动结束。PTT 的语义是"按住多久录多久"，
-            //   用户按住说话中途思考/停顿 1-2 秒很常见 —— 若此时 VAD 自动切断，
-            //   录音就断了，用户还按着却没在录（真机返工记录的"第三秒跳变"）。
-            //   按键仍按住（s_stop_pending == false）时跳过静音判定，继续录。
+            // ★ 这里曾经有一段"连续静音 1.2s 自动结束录音"，条件写的是 `!s_stop_pending`——
+            //   而 s_stop_pending 只在**松开**时置位（stop() 还会把 state 置成 FLUSHING，
+            //   循环本来就会退出）。也就是说该条件唯一能成立的场景是"用户还按着"，
+            //   与它自己的注释、日志文案（"按键已松开"）完全相反：用户按住说话时，
+            //   只要中途停顿 1.2 秒，录音就被静默切断，后半句再也录不到。
+            //   PTT 的语义就是"按住多久录多久"，因此这段判定整个移除：
+            //   录音只由「松手」或「上限 s_max_reads」结束。
             int32_t rms = rms_of(s_pcm, READ_SAMPLES);
             if (rms > max_rms) max_rms = rms;
-            if (rms < VAD_RMS_THRESHOLD) {
-                s_silence_count++;
-                if (!s_stop_pending &&
-                    s_silence_count >= SILENCE_READS && s_read_count > SILENCE_READS) {
-                    ESP_LOGI(TAG, "静音超时且按键已松开，自动结束录音");
-                    stop = true;
-                }
-            } else {
-                s_silence_count = 0;
-            }
 
             encode_and_flush();
 
-            // 15s 上限
-            if (s_read_count >= MAX_READS) {
-                ESP_LOGI(TAG, "达到 15s 上限，自动结束录音");
+            // 录音上限：主机下发的秒数（默认 60s，协议硬上限 AP_AUDIO_MAX_SECONDS）
+            if (s_read_count >= s_max_reads) {
+                ESP_LOGI(TAG, "达到录音上限 %dms，自动结束录音", s_max_reads * READ_MS);
                 stop = true;
             }
         }
@@ -349,8 +348,27 @@ esp_err_t app_voice_init(void)
         return ESP_ERR_NO_MEM;
     }
     s_initialized = true;
-    ESP_LOGI(TAG, "语音上行就绪（PTT 按住说话，上限 %dms）", MAX_MS);
+    ESP_LOGI(TAG, "语音上行就绪（PTT 按住说话，硬上限 %dms，实际上限等主机 config 下发）", MAX_MS);
     return ESP_OK;
+}
+
+/**
+ * 设置录音上限（主机 config 消息 → app.c handle_config 调用）。
+ *
+ * 秒数会被夹到 [1, AP_AUDIO_MAX_SECONDS]：主机给坏值也不会把设备带偏。
+ * 只写内存，不落 NVS —— 事实来源在主机，每次链路就绪都会重发。
+ *
+ * @param seconds 期望的录音上限（秒）
+ */
+void app_voice_set_max_seconds(int seconds)
+{
+    if (seconds < 1) seconds = 1;
+    if (seconds > AP_AUDIO_MAX_SECONDS) seconds = AP_AUDIO_MAX_SECONDS;
+    int reads = (seconds * 1000) / READ_MS;
+    if (reads < 1) reads = 1;
+    if (reads > MAX_READS) reads = MAX_READS;
+    s_max_reads = reads;
+    ESP_LOGI(TAG, "录音上限已更新：%d 秒（%d 轮）", seconds, reads);
 }
 
 bool app_voice_start(void)

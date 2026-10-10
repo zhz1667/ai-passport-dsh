@@ -434,9 +434,9 @@ static void handle_task_state(const char *json)
 }
 
 /**
- * 处理主机下发的设备配置：{soundEnabled?}
+ * 处理主机下发的设备配置：{soundEnabled?, maxRecordSeconds?}
  *
- * ★ 提示音开关放在主机侧配置，而不是设备上的持久设置：
+ * ★ 提示音开关与录音上限都放在主机侧配置，而不是设备上的持久设置：
  *   设备端写 NVS 会带来磨损，而且两边各存一份必然分叉 ——
  *   用户在面板上关了提示音，设备却还记得旧的"开"，这种不一致极难排查。
  *   设备只保存内存态，每次连上都由主机下发，唯一事实来源在主机。
@@ -446,6 +446,11 @@ static void handle_config(const char *json)
     bool sound = true;
     if (ap_json_bool(json, "soundEnabled", &sound)) {
         alert_set_setting(sound);
+    }
+    // 录音上限（秒）：默认 60，可选 60/120/360；设备侧再夹到 [1, AP_AUDIO_MAX_SECONDS]
+    long max_seconds = 0;
+    if (ap_json_num(json, "maxRecordSeconds", &max_seconds)) {
+        app_voice_set_max_seconds((int)max_seconds);
     }
 }
 

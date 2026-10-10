@@ -4,7 +4,8 @@
 //   · PTT：按住确定开始录音，松开结束（BSP 提供 PRESS/RELEASE）。
 //   · 流式：边录边发，静态环形缓冲 + 源端丢帧，**绝不缓冲整段录音**（400KB RAM 装不下）。
 //   · 编码：IMA/DVI ADPCM 4:1，块格式与主机 voice.js 的 decodeImaAdpcm 逐字节一致。
-//   · 上限 15s；VAD 静音 1.2s 自动结束。
+//   · 上限由主机 config 消息下发（默认 60s，可选 60/120/360），硬天花板 AP_AUDIO_MAX_SECONDS；
+//     录音只由「松手」或「达到上限」结束（不再有静音自动结束 —— 见 app_voice.c 的说明）。
 //
 // 线程模型（照抄 app_alert）：
 //   · 采集在独立任务 app_voice_task（bsp_audio_read 阻塞，不能放 LVGL/按键任务）。
@@ -31,6 +32,10 @@ void app_voice_stop(void);
 
 // 是否正在录音（按键/熄屏/UI 判断用）。
 bool app_voice_recording(void);
+
+// 设置单次录音上限（秒），夹在 [1, AP_AUDIO_MAX_SECONDS]。
+// 由主机 config 消息触发（app.c handle_config），只存内存态、每次链路就绪重发。
+void app_voice_set_max_seconds(int seconds);
 
 // 主机回的识别结果/错误 → toast 反馈（由 app.c 收到消息时调用）。
 void app_voice_on_result(const char *text);

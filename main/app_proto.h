@@ -296,7 +296,10 @@ typedef enum {
 #define AP_AUDIO_FALLBACK_SAMPLE_RATE 8000
 #define AP_AUDIO_BITS 16
 #define AP_AUDIO_CHANNELS 1
-#define AP_AUDIO_MAX_SECONDS 15
+// 录音**硬上限**（秒）：协议天花板，不是实际生效值。
+// app_voice.c 的 MAX_MS 由它推导；用户实际生效的上限由主机通过 config 消息下发
+// （默认 60s，可选 60/120/360），设备侧夹在 [1, 本值]。改这里必须同步改 constants.js。
+#define AP_AUDIO_MAX_SECONDS 360
 #define AP_AUDIO_SILENCE_STOP_MS 1200
 
 // 帧头各字段的位运算助手。写成内联函数而不是宏，便于加类型检查。
